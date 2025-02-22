@@ -1,6 +1,7 @@
 import streamlit as st
 import json
 from langchain_community.llms import Ollama
+from langchain_openai import ChatOpenAI
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationChain
 from langchain.callbacks.manager import CallbackManager
@@ -213,38 +214,46 @@ if "messages" not in st.session_state:
 if "memory" not in st.session_state:
     st.session_state.memory = ConversationBufferMemory()
 
-def get_llm_chain(model="llama2"):
+def get_llm_chain(model="gpt-4"):
     """Initialize and return a LangChain conversation chain."""
-    # Initialize the Ollama LLM with tracing
+    # Initialize the callback manager for tracing
     callback_manager = CallbackManager([
         StreamingStdOutCallbackHandler(),
         tracer
     ])
-    
-    llm = Ollama(
-        model=model,
-        callback_manager=callback_manager,
-    )
-    
-    # Create a conversation chain with memory
-    chain = ConversationChain(
+
+    # Initialize the appropriate LLM based on the model selection
+    if model == "gpt-4":
+        llm = ChatOpenAI(
+            model_name="gpt-4",
+            temperature=0.7,
+            streaming=True,
+            callback_manager=callback_manager
+        )
+    else:
+        # Use Ollama for other models
+        llm = Ollama(
+            model=model,
+            callback_manager=callback_manager
+        )
+
+    # Initialize and return the conversation chain
+    return ConversationChain(
         llm=llm,
         memory=st.session_state.memory,
         verbose=True
     )
-    
-    return chain
 
 # Streamlit UI
-st.title("💬 AI Chat Assistant for World Constitutions")
-st.subheader("Chat with an AI with knowledge of the World Constitutions")
+st.title("💬 Chat with an AI with knowledge of the World Constitutions")
+st.subheader("The AI currently only knows of world constitutions for countries that start with the letter A")
 
 # Sidebar
 with st.sidebar:
     # Model selection
     model = st.selectbox(
         "Choose your model",
-        ["llama2", "mistral", "codellama"],
+        ["gpt-4", "llama2", "mistral", "codellama"],
         index=0
     )
     
