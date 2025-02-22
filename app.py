@@ -3,10 +3,11 @@ import json
 from langchain_community.llms import Ollama
 from langchain_openai import ChatOpenAI
 from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationChain
+from langchain.chains import LLMChain
 from langchain.callbacks.manager import CallbackManager
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
 from langchain.callbacks.tracers import LangChainTracer
+from langchain.prompts import PromptTemplate
 from langsmith import Client
 from datetime import datetime
 import os
@@ -26,13 +27,17 @@ supabase_key = os.environ.get("SUPABASE_ANON_KEY")  # Use anon key for regular o
 supabase = create_client(supabase_url, supabase_key)
 
 # Initialize Pinecone
-pinecone_client = PineconeClient(api_key=os.getenv('PINECODE_API_KEY'))
+pc = PineconeClient(
+    api_key=os.getenv("PINECONE_API_KEY"),
+    environment=os.getenv("PINECONE_ENVIRONMENT")
+)
+
 index_name = "pdf-embeddings"
 
 # Initialize vector store
 embeddings = OpenAIEmbeddings()
 vectorstore = Pinecone(
-    pinecone_client.Index(index_name),
+    pc.Index(index_name),
     embeddings,
     "text"  # This is the field in metadata that contains the text content
 )
@@ -140,6 +145,83 @@ def delete_custom_prompt(user_id, prompt_id):
     except Exception as e:
         st.error(f"Error deleting prompt: {str(e)}")
 
+def get_relevant_context(query):
+    """Get relevant context from Pinecone based on query similarity."""
+    try:
+        # Create embeddings for the query
+        embeddings = OpenAIEmbeddings(
+            api_key=os.getenv("OPENAI_API_KEY")
+        )
+        query_embedding = embeddings.embed_query(query)
+        
+        # Get the Pinecone index
+        index = pc.Index("pdf-embeddings")
+        
+        # Query Pinecone
+        results = index.query(
+            vector=query_embedding,
+            top_k=3,
+            include_metadata=True
+        )
+        
+        # Format the context from the results
+        context = []
+        for match in results.matches:
+            if match.metadata and 'text' in match.metadata:
+                context.append(match.metadata['text'])
+        
+        return "\n\n".join(context) if context else "No relevant context found."
+    except Exception as e:
+        print(f"Error in get_relevant_context: {str(e)}")
+        return "Error retrieving context from the database."
+
+def get_llm_chain(model="gpt-4"):
+    """Initialize and return a LangChain conversation chain."""
+    # Initialize the callback manager for tracing
+    callback_manager = CallbackManager([
+        StreamingStdOutCallbackHandler(),
+        LangChainTracer(),
+    ])
+
+    # Initialize the appropriate LLM based on the model selection
+    if model == "gpt-4":
+        llm = ChatOpenAI(
+            model_name="gpt-4",
+            temperature=0.7,
+            streaming=True,
+            callback_manager=callback_manager
+        )
+    else:
+        # Use Ollama for other models
+        llm = Ollama(
+            model=model,
+            callback_manager=callback_manager
+        )
+
+    # Create the prompt template
+    template = """You are an AI assistant with knowledge of world constitutions.
+    
+Context from relevant constitutional documents:
+{context}
+
+Current conversation:
+{history}
+Human: {input}
+Assistant: Let me help you with that based on the constitutional context provided."""
+
+    prompt = PromptTemplate(
+        input_variables=["history", "input", "context"],
+        template=template
+    )
+
+    # Initialize and return the chain
+    return LLMChain(
+        llm=llm,
+        prompt=prompt,
+        memory=st.session_state.memory,
+        verbose=True
+    )
+
 # Initialize LangSmith
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGSMITH_PROJECT", "ollama-chat-app")
@@ -208,41 +290,18 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Initialize session state for chat history and memory
+# Initialize session state
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
 if "memory" not in st.session_state:
-    st.session_state.memory = ConversationBufferMemory()
-
-def get_llm_chain(model="gpt-4"):
-    """Initialize and return a LangChain conversation chain."""
-    # Initialize the callback manager for tracing
-    callback_manager = CallbackManager([
-        StreamingStdOutCallbackHandler(),
-        tracer
-    ])
-
-    # Initialize the appropriate LLM based on the model selection
-    if model == "gpt-4":
-        llm = ChatOpenAI(
-            model_name="gpt-4",
-            temperature=0.7,
-            streaming=True,
-            callback_manager=callback_manager
-        )
-    else:
-        # Use Ollama for other models
-        llm = Ollama(
-            model=model,
-            callback_manager=callback_manager
-        )
-
-    # Initialize and return the conversation chain
-    return ConversationChain(
-        llm=llm,
-        memory=st.session_state.memory,
-        verbose=True
+    st.session_state.memory = ConversationBufferMemory(
+        memory_key="history",
+        input_key="input"
     )
+
+if "context" not in st.session_state:
+    st.session_state.context = ""
 
 # Streamlit UI
 st.title("💬 Chat with an AI with knowledge of the World Constitutions")
@@ -307,7 +366,10 @@ with st.sidebar:
                     try:
                         start_time = datetime.now()
                         chain = get_llm_chain(model)
-                        response = chain.predict(input=prompt['content'])
+                        response = chain.run(
+                            input=prompt['content'],
+                            context=st.session_state.context
+                        )
                         end_time = datetime.now()
                         duration_ms = (end_time - start_time).total_seconds() * 1000
                         
@@ -345,7 +407,6 @@ with st.sidebar:
     else:
         st.info("No saved prompts yet. Create one above!")
 
-
 # Display chat messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
@@ -363,11 +424,20 @@ if prompt := st.chat_input("What would you like to discuss?"):
 
     # Get AI response using LangChain
     with st.chat_message("assistant"):
-        with st.spinner("🧠..."):
+        with st.spinner("🧠 Searching constitutional knowledge..."):
             try:
                 start_time = datetime.now()
+                
+                # Get relevant context from vector database
+                context = get_relevant_context(prompt)
+                
+                # Get response from LLM with context
                 chain = get_llm_chain(model)
-                response = chain.predict(input=prompt)
+                response = chain.run(
+                    input=prompt,
+                    context=context
+                )
+                
                 end_time = datetime.now()
                 duration_ms = (end_time - start_time).total_seconds() * 1000
                 
@@ -402,7 +472,10 @@ if prompt := st.chat_input("What would you like to discuss?"):
 if st.sidebar.button("Clear Chat!"):
     # Do not reset user_id to maintain prompt ownership
     st.session_state.messages = []
-    st.session_state.memory = ConversationBufferMemory()
+    st.session_state.memory = ConversationBufferMemory(
+        memory_key="history",
+        input_key="input"
+    )
     # Start a new conversation
     st.session_state.current_conversation_id = str(uuid.uuid4())
     st.session_state.last_message_id = None
